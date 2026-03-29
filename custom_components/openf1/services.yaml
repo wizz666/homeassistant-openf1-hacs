@@ -1,0 +1,4 @@
+refresh:
+  name: Refresh
+  description: Immediately fetches new data from the OpenF1 API.
+  fields: {}

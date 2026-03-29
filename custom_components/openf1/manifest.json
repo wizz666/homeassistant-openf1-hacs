@@ -1,0 +1,14 @@
+{
+  "domain": "openf1",
+  "name": "OpenF1",
+  "codeowners": [
+    "@wizz666"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/wizz666/homeassistant-openf1-hacs",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/wizz666/homeassistant-openf1-hacs/issues",
+  "requirements": [],
+  "version": "1.1.0"
+}

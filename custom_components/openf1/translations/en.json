@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "OpenF1 setup",
+        "description": "Connect to the free OpenF1 API (api.openf1.org) for live Formula 1 data. No API key needed.",
+        "data": {
+          "poll_interval": "Update interval (seconds)",
+          "favorite_driver": "Favorite driver number (optional, e.g. 44)"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one OpenF1 instance is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "OpenF1 settings",
+        "data": {
+          "poll_interval": "Update interval (seconds)",
+          "favorite_driver": "Favorite driver number (optional, e.g. 44)"
+        }
+      }
+    }
+  }
+}
