@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import ssl
+import threading
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -47,6 +50,189 @@ _FLAG_EMOJI = {
 }
 
 
+# ── MQTT live data collector ───────────────────────────────────────────────────
+
+class MQTTLiveCollector:
+    """Background MQTT subscriber for openf1.org push data.
+
+    Connects to mqtt.openf1.org:8883 (TLS) with public credentials openf1/openf1.
+    Stores the latest payload per driver for each topic in a thread-safe dict.
+    """
+
+    BROKER = "mqtt.openf1.org"
+    PORT = 8883
+    USER = "openf1"
+    PASSWORD = "openf1"
+    TOPICS = [
+        "v1/position", "v1/intervals", "v1/race_control",
+        "v1/weather", "v1/drivers", "v1/stints", "v1/laps",
+    ]
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._positions: dict[int, dict] = {}
+        self._intervals: dict[int, dict] = {}
+        self._weather: dict = {}
+        self._rc_messages: list[dict] = []
+        self._drivers: dict[int, dict] = {}
+        self._stints: dict[int, dict] = {}
+        self._laps: dict[int, dict] = {}
+        self._client = None
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Start the MQTT background thread (idempotent)."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="openf1-mqtt")
+        self._thread.start()
+        _LOGGER.debug("[MQTT] Background thread started")
+
+    def stop(self) -> None:
+        """Stop the MQTT client and background thread."""
+        self._running = False
+        if self._client:
+            try:
+                self._client.disconnect()
+                self._client.loop_stop()
+            except Exception:
+                pass
+        _LOGGER.debug("[MQTT] Stopped")
+
+    def clear_session(self) -> None:
+        """Clear per-session data when a new session begins."""
+        with self._lock:
+            self._positions.clear()
+            self._intervals.clear()
+            self._weather.clear()
+            self._rc_messages.clear()
+            self._drivers.clear()
+            self._stints.clear()
+            self._laps.clear()
+
+    def has_data(self) -> bool:
+        """Return True if position data has been received."""
+        with self._lock:
+            return bool(self._positions)
+
+    def snapshot(self) -> dict:
+        """Return a thread-safe deep-enough copy of the current data."""
+        with self._lock:
+            return {
+                "positions": dict(self._positions),
+                "intervals": dict(self._intervals),
+                "weather": dict(self._weather),
+                "rc_messages": list(self._rc_messages),
+                "drivers": dict(self._drivers),
+                "stints": dict(self._stints),
+                "laps": dict(self._laps),
+            }
+
+    # ── Background thread ─────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            _LOGGER.error("[MQTT] paho-mqtt not installed — live push disabled")
+            return
+
+        # Support both paho v1 and v2
+        try:
+            cb_ver = mqtt.CallbackAPIVersion.VERSION2
+        except AttributeError:
+            cb_ver = None
+
+        def on_connect(client, userdata, flags, rc, properties=None):
+            if rc == 0:
+                _LOGGER.debug("[MQTT] Connected to openf1.org — subscribing")
+                for topic in self.TOPICS:
+                    client.subscribe(topic, qos=0)
+            else:
+                _LOGGER.warning("[MQTT] Connect failed rc=%s", rc)
+
+        def on_message(client, userdata, msg):
+            try:
+                payload = json.loads(msg.payload.decode())
+                self._handle_message(msg.topic, payload)
+            except Exception as exc:
+                _LOGGER.debug("[MQTT] Parse error on %s: %s", msg.topic, exc)
+
+        def on_disconnect(client, userdata, rc, properties=None, reason_code=None):
+            if self._running:
+                _LOGGER.debug("[MQTT] Disconnected rc=%s — reconnecting", rc)
+
+        if cb_ver is not None:
+            client = mqtt.Client(callback_api_version=cb_ver, client_id="ha-openf1")
+        else:
+            client = mqtt.Client(client_id="ha-openf1")
+
+        client.username_pw_set(self.USER, self.PASSWORD)
+        client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.on_disconnect = on_disconnect
+        self._client = client
+
+        while self._running:
+            try:
+                _LOGGER.debug("[MQTT] Connecting to %s:%s", self.BROKER, self.PORT)
+                client.connect(self.BROKER, self.PORT, keepalive=60)
+                client.loop_forever(retry_first_connection=True)
+            except Exception as exc:
+                _LOGGER.warning("[MQTT] Error: %s — retry in 30s", exc)
+                if self._running:
+                    threading.Event().wait(30)
+
+    def _handle_message(self, topic: str, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        with self._lock:
+            if topic == "v1/position":
+                num = payload.get("driver_number")
+                if num is not None:
+                    ex = self._positions.get(num)
+                    if ex is None or payload.get("date", "") >= ex.get("date", ""):
+                        self._positions[num] = payload
+
+            elif topic == "v1/intervals":
+                num = payload.get("driver_number")
+                if num is not None:
+                    ex = self._intervals.get(num)
+                    if ex is None or payload.get("date", "") >= ex.get("date", ""):
+                        self._intervals[num] = payload
+
+            elif topic == "v1/weather":
+                if payload.get("date", "") >= self._weather.get("date", ""):
+                    self._weather = payload
+
+            elif topic == "v1/race_control":
+                self._rc_messages.append(payload)
+                if len(self._rc_messages) > 100:
+                    self._rc_messages = self._rc_messages[-100:]
+
+            elif topic == "v1/drivers":
+                num = payload.get("driver_number")
+                if num is not None:
+                    self._drivers[num] = payload
+
+            elif topic == "v1/stints":
+                num = payload.get("driver_number")
+                if num is not None:
+                    ex = self._stints.get(num)
+                    if ex is None or payload.get("stint_number", 0) >= ex.get("stint_number", 0):
+                        self._stints[num] = payload
+
+            elif topic == "v1/laps":
+                num = payload.get("driver_number")
+                if num is not None:
+                    ex = self._laps.get(num)
+                    if ex is None or payload.get("lap_number", 0) >= ex.get("lap_number", 0):
+                        self._laps[num] = payload
+
+
 class OpenF1Coordinator(DataUpdateCoordinator):
     """Fetches and caches F1 data from livetiming.formula1.com."""
 
@@ -59,6 +245,7 @@ class OpenF1Coordinator(DataUpdateCoordinator):
         self._championship_fetched: datetime | None = None
         self._index_cache: dict | None = None         # Index.json content
         self._index_fetched: datetime | None = None   # when Index was last fetched
+        self._mqtt = MQTTLiveCollector()              # MQTT push collector
 
         self._base_interval = int(
             entry.options.get(CONF_POLL_INTERVAL)
@@ -72,6 +259,7 @@ class OpenF1Coordinator(DataUpdateCoordinator):
 
     def _reset_session_state(self) -> None:
         self._last_rc_date = ""
+        self._mqtt.clear_session()
 
     # ── Public update entry point ─────────────────────────────────────────────
 
@@ -348,12 +536,19 @@ class OpenF1Coordinator(DataUpdateCoordinator):
                 "intervals": [],
             }
 
-            # ── 4. CDN locked during live broadcast — use openf1.org ─────────
+            # ── 4. CDN locked during live broadcast — use MQTT or openf1.org ──
             if cdn_locked:
-                _LOGGER.debug("[F1LT] CDN locked during live %s — fetching from openf1.org", sess_type)
-                live = await self._fetch_openf1_live(
-                    http, sess_info, meeting_info, start_utc, end_utc, index, now_utc
-                )
+                if self._mqtt.has_data():
+                    _LOGGER.debug("[F1LT] CDN locked — using MQTT live data")
+                    snap = self._mqtt.snapshot()
+                    live = self._build_from_mqtt(
+                        snap, sess_info, meeting_info, start_utc, end_utc, index, now_utc
+                    )
+                else:
+                    _LOGGER.debug("[F1LT] CDN locked — falling back to openf1.org REST")
+                    live = await self._fetch_openf1_live(
+                        http, sess_info, meeting_info, start_utc, end_utc, index, now_utc
+                    )
                 live["championship"] = await self._fetch_championship(http, now_utc)
                 return live
 
@@ -818,6 +1013,193 @@ class OpenF1Coordinator(DataUpdateCoordinator):
         _LOGGER.debug(
             "[OpenF1] Live data: %d drivers, %d rc messages",
             len(drivers), len(rc_raw) if isinstance(rc_raw, list) else 0,
+        )
+        return data
+
+    # ── Build data from MQTT snapshot ─────────────────────────────────────────
+
+    def _build_from_mqtt(
+        self,
+        snap: dict,
+        sess_info: dict,
+        meeting_info: dict | None,
+        start_utc: datetime,
+        end_utc: datetime,
+        index: dict,
+        now_utc: datetime,
+    ) -> dict:
+        """Build coordinator data dict from MQTT snapshot (synchronous)."""
+        sess_type = sess_info.get("Type", "")
+        sess_name = sess_info.get("Name", "")
+
+        data: dict = {
+            "session": {
+                "session_key": sess_info.get("Key"),
+                "session_name": sess_name,
+                "session_type": sess_type,
+                "circuit": "",
+                "country": meeting_info.get("Location", "") if meeting_info else "",
+                "date_start": start_utc.isoformat(),
+                "date_end": end_utc.isoformat(),
+                "is_active": True,
+                "cdn_locked": True,
+            },
+            "drivers": {},
+            "standings": [],
+            "fastest_lap": None,
+            "track_status": {
+                "flag": "Unknown", "raw_flag": "", "message": "",
+                "category": "", "lap": None, "recent_messages": [],
+            },
+            "weather": {},
+            "next_event": self._find_next_race(index, now_utc),
+            "stints": {},
+            "intervals": [],
+            "api_restricted": False,
+            "is_stale": False,
+        }
+
+        # ── Drivers ──────────────────────────────────────────────────────────
+        drivers: dict[int, dict] = {}
+        for num, d in snap["drivers"].items():
+            color = d.get("team_colour", "FFFFFF") or "FFFFFF"
+            drivers[num] = {
+                "name": d.get("full_name", f"#{num}"),
+                "abbreviation": d.get("name_acronym", f"#{num}"),
+                "team": d.get("team_name", ""),
+                "team_color": f"#{color}" if not color.startswith("#") else color,
+            }
+        # Fallback: build from position keys if driver list not yet received
+        if not drivers:
+            for num in snap["positions"]:
+                drivers[num] = {
+                    "name": f"#{num}", "abbreviation": f"#{num}",
+                    "team": "", "team_color": "#ffffff",
+                }
+        data["drivers"] = drivers
+
+        # ── Standings + intervals ─────────────────────────────────────────────
+        entries = []
+        for num, pos_data in snap["positions"].items():
+            drv = drivers.get(num, {})
+            stint = snap["stints"].get(num, {})
+            iv = snap["intervals"].get(num, {})
+            lap_data = snap["laps"].get(num, {})
+
+            gap_val = iv.get("gap_to_leader")
+            if isinstance(gap_val, (int, float)) and gap_val > 0:
+                gap_str = f"+{gap_val:.3f}"
+            else:
+                gap_str = "LEADER"
+
+            # Best lap from laps topic (duration in seconds)
+            best_lap_str = ""
+            lap_dur = lap_data.get("lap_duration")
+            if lap_dur:
+                try:
+                    mins = int(lap_dur) // 60
+                    secs = float(lap_dur) - mins * 60
+                    best_lap_str = f"{mins}:{secs:06.3f}"
+                except (ValueError, TypeError):
+                    pass
+
+            entries.append({
+                "position": pos_data.get("position", 99),
+                "driver_number": num,
+                "name": drv.get("name", f"#{num}"),
+                "abbreviation": drv.get("abbreviation", f"#{num}"),
+                "team": drv.get("team", ""),
+                "team_color": drv.get("team_color", "#ffffff"),
+                "compound": (stint.get("compound") or "").upper(),
+                "best_lap": best_lap_str,
+                "gap": gap_str,
+                "gap_to_leader": gap_val,
+                "in_pit": False,
+                "num_laps": stint.get("lap_end") or 0,
+            })
+        entries.sort(key=lambda x: x["position"])
+
+        data["standings"] = [{
+            "position": e["position"],
+            "driver_number": e["driver_number"],
+            "name": e["name"],
+            "abbreviation": e["abbreviation"],
+            "team": e["team"],
+            "team_color": e["team_color"],
+            "compound": e["compound"],
+            "best_lap": e["best_lap"],
+            "gap": e["gap"],
+            "in_pit": e["in_pit"],
+            "num_laps": e["num_laps"],
+        } for e in entries[:20]]
+
+        data["intervals"] = [{
+            "position": e["position"],
+            "driver_number": e["driver_number"],
+            "abbreviation": e["abbreviation"],
+            "gap_to_leader": e["gap_to_leader"],
+            "gap_str": e["gap"],
+            "in_pit": e["in_pit"],
+        } for e in entries]
+
+        # ── Fastest lap ───────────────────────────────────────────────────────
+        best_entry = None
+        best_seconds: float = 9999.0
+        for e in entries:
+            t = e.get("best_lap", "")
+            if not t:
+                continue
+            secs = self._lap_str_to_seconds(t)
+            if secs and secs < best_seconds:
+                best_seconds = secs
+                best_entry = e
+        if best_entry:
+            data["fastest_lap"] = {
+                "time_str": best_entry["best_lap"],
+                "duration_s": best_seconds,
+                "driver_number": best_entry["driver_number"],
+                "driver_name": best_entry["name"],
+                "driver_abbr": best_entry["abbreviation"],
+                "team": best_entry["team"],
+                "lap_number": None,
+            }
+
+        # ── Race control + track status ───────────────────────────────────────
+        rc_messages = snap["rc_messages"]
+        if rc_messages:
+            rc_sorted = sorted(rc_messages, key=lambda x: x.get("date", ""))
+            recent_texts = [m.get("message", "") for m in rc_sorted[-5:] if m.get("message")]
+            for msg in reversed(rc_sorted):
+                raw_flag = (msg.get("flag") or "").upper().replace(" ", "_")
+                if raw_flag:
+                    flag_label = raw_flag.replace("_", " ").title()
+                    data["track_status"] = {
+                        "flag": flag_label,
+                        "raw_flag": raw_flag,
+                        "message": msg.get("message", ""),
+                        "category": msg.get("category", ""),
+                        "lap": msg.get("lap_number"),
+                        "recent_messages": recent_texts,
+                    }
+                    break
+            else:
+                data["track_status"]["recent_messages"] = recent_texts
+
+        # ── Weather ───────────────────────────────────────────────────────────
+        w = snap["weather"]
+        if w:
+            data["weather"] = {
+                "track_temp": self._to_float(w.get("track_temperature")),
+                "air_temp": self._to_float(w.get("air_temperature")),
+                "humidity": self._to_float(w.get("humidity")),
+                "rainfall": self._to_float(w.get("rainfall")),
+                "wind_speed": self._to_float(w.get("wind_speed")),
+                "wind_direction": self._to_float(w.get("wind_direction")),
+            }
+
+        _LOGGER.debug(
+            "[MQTT] Snapshot: %d positions, %d drivers, %d rc",
+            len(snap["positions"]), len(snap["drivers"]), len(snap["rc_messages"]),
         )
         return data
 
